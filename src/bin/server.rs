@@ -8,8 +8,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncWriteExt};
-use tracing::{error, info, warn};
-use simple_rpc_rust::{RpcRequest, resp_ok, resp_err, read_frame, write_frame};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+use simple_rpc_rust::{RpcRequest, resp_ok, resp_err, resp_accepted, read_frame, write_frame};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,12 +35,33 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_client(mut sock: TcpStream) -> Result<()> {
+async fn handle_client(sock: TcpStream) -> anyhow::Result<()> {
+    // Split the socket into independent reader / writer halves
+    let (mut rd, mut wr) = sock.into_split();
+
+    // Channel for serialized writes from this connection
+    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Dedicated writer task: take frames from the channel and write them in order
+    let _writer_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = write_frame(&mut wr, &msg).await {
+                // Stop on write error (client disconnected, etc.)
+                return Err::<(), anyhow::Error>(e.into());
+            }
+            if let Err(e) = wr.flush().await {
+                return Err::<(), anyhow::Error>(e.into());
+            }
+        }
+        Ok(())
+    });
+
+    // Main read/dispatch loop
     loop {
-        let val = match read_frame(&mut sock).await {
+        let val = match read_frame(&mut rd).await {
             Ok(v) => v,
             Err(e) => {
-                // EOF is also an error here; just break
+                // EOF or framing/JSON error -> end this connection
                 return Err(e.into());
             }
         };
@@ -47,34 +69,42 @@ async fn handle_client(mut sock: TcpStream) -> Result<()> {
         let req: RpcRequest = match serde_json::from_value(val) {
             Ok(r) => r,
             Err(e) => {
-                // Cannot recover request_id; close socket after logging
-                error!("Malformed request JSON: {e}");
-                return Err(anyhow!("malformed request"));
+                // Cannot recover the request_id to respond; close connection
+                tracing::error!("Malformed request: {e}");
+                return Err(anyhow::anyhow!("malformed request"));
             }
         };
 
+        // 1) Immediately acknowledge
+        let _ = tx.send(resp_accepted(&req.request_id));
+
+        // 2) Offload the work; when done, send Completed/Error
         let request_id = req.request_id.clone();
         let func = req.func.clone();
         let params = req.params.clone();
+        let tx2 = tx.clone();
 
-        let res = match func.as_str() {
-            "hash_compute" => op_hash_compute(params).await,
-            "sort_array" => op_sort_array(params).await,
-            "matrix_multiply" => op_matrix_multiply(params).await,
-            "compress_data" => op_compress_data(params).await,
-            other => Err(anyhow!("unknown function '{}'", other)),
-        };
+        tokio::spawn(async move {
+            // Run the operation (matrix multiply can still use spawn_blocking inside)
+            let res = match func.as_str() {
+                "hash_compute" => op_hash_compute(params).await,
+                "sort_array" => op_sort_array(params).await,
+                "matrix_multiply" => op_matrix_multiply(params).await,
+                "compress_data" => op_compress_data(params).await,
+                other => Err(anyhow::anyhow!("unknown function '{other}'")),
+            };
 
-        let resp = match res {
-            Ok(okv) => resp_ok(&request_id, okv),
-            Err(e) => resp_err(&request_id, e.to_string()),
-        };
-
-        if let Err(e) = write_frame(&mut sock, &resp).await {
-            return Err(anyhow!("write response: {e}"));
-        }
-        sock.flush().await?;
+            // 3) Send the final result
+            let frame = match res {
+                Ok(okv) => resp_ok(&request_id, okv),
+                Err(e) => resp_err(&request_id, e.to_string()),
+            };
+            let _ = tx2.send(frame); // ignore if the client went away
+        });
     }
+
+    // (Unreachable because we `return` on read error above, but if you
+    // ever add a break: drop(tx); let _ = writer_task.await; Ok(())
 }
 
 // ---------- Operations ----------

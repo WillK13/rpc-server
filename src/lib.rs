@@ -5,6 +5,7 @@ use bytes::{BytesMut, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use thiserror::Error;
 
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub request_id: String,
@@ -16,6 +17,11 @@ pub struct RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum RpcResponse {
+    // NEW: immediate ack so server can accept fast and finish later
+    Accepted {
+        request_id: String,
+        ok: bool, // always true here
+    },
     Completed {
         request_id: String,
         ok: bool,
@@ -26,7 +32,7 @@ pub enum RpcResponse {
     },
     Error {
         request_id: String,
-        ok: bool,
+        ok: bool, // always false here
         error: String,
     },
 }
@@ -60,7 +66,14 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(mut r: R) -> Result<serde_json:
     Ok(v)
 }
 
-/// Convenience helpers for building responses
+/// Convenience builders
+pub fn resp_accepted(request_id: &str) -> serde_json::Value {
+    serde_json::to_value(RpcResponse::Accepted {
+        request_id: request_id.to_string(),
+        ok: true,
+    }).unwrap()
+}
+
 pub fn resp_ok(request_id: &str, result: serde_json::Value) -> serde_json::Value {
     serde_json::to_value(RpcResponse::Completed {
         request_id: request_id.to_string(),
