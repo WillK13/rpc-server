@@ -111,8 +111,12 @@ async fn main() -> Result<()> {
     let addr = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:8080");
     let rps: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
     let duration_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let mode: String = args
+        .get(4)
+        .map(|s| s.as_str().to_owned())
+        .unwrap_or_else(|| "mix".to_owned());
 
-    info!("Loadgen addr={addr} rps={rps} duration={duration_secs}s");
+        info!("Loadgen addr={addr} rps={rps} duration={duration_secs}s");
 
     // small pool of persistent connections; round-robin each request
     let pool_size = ((rps as f64).sqrt().ceil() as usize).max(4).min(64);
@@ -141,62 +145,63 @@ async fn main() -> Result<()> {
         i += 1;
         let txc = tx.clone();
         let rngc = rng.clone();
+        let mode_c = mode.clone();
 
         tokio::spawn(async move {
-            // choose operation
-            let mut rng = rngc.lock().await;
-            let p: f64 = rng.gen();
-            drop(rng);
+    // choose operation (single-op mode overrides mix)
+    let mut rng = rngc.lock().await;
+let p: f64 = rng.gen();
+drop(rng);
 
-            let start = Instant::now();
-            let res: Result<()> = async {
-                let mut c = cli.lock().await;
+let which = if mode_c != "mix" {
+    mode_c.as_str()
+} else {
+    if p < 0.5 { "hash" }
+    else if p < 0.7 { "sort" }
+    else if p < 0.8 { "matmul" }
+    else { "compress" }
+};
 
-                if p < 0.5 {
-                    // 50% hash (256B)
-                    let mut data = vec![0u8; 256];
-                    for (i, b) in data.iter_mut().enumerate() {
-                        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
-                    }
-                    let _ = c.hash_compute(&data).await?;
-
-                } else if p < 0.7 {
-                    // 20% sort (1k ints) — SAFE MATH (no overflow)
-                    let mut vals = vec![0i32; 1000];
-                    for (i, v) in vals.iter_mut().enumerate() {
-                        // do the LCG-like math in u64, then downcast
-                        let x = ((i as u64 * 1_103_515_245u64 + 12_345u64) >> 8) as u32;
-                        *v = (x as i32) ^ 0x5a5a5a5a;
-                    }
-                    let _ = c.sort_array(vals).await?;
-
-                } else if p < 0.8 {
-                    // 10% matmul 16x16
-                    let n = 16usize;
-                    let mut a = vec![0.0f64; n*n];
-                    let mut b = vec![0.0f64; n*n];
-                    for i in 0..n*n { a[i] = (i as f64).sin(); b[i] = (i as f64).cos(); }
-                    let _ = c.matrix_multiply(n, a, b).await?;
-
-                } else {
-                    // 20% compress zlib (512B)
-                    let mut data = vec![0u8; 512];
-                    for (i, b) in data.iter_mut().enumerate() {
-                        *b = (i as u8).wrapping_mul(17).wrapping_add(3);
-                    }
-                    let _ = c.compress_data("zlib", &data).await?;
-                }
-
-                Ok(())
-            }.await;
-
-
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            let _ = txc.send(elapsed);
-            if let Err(e) = res {
-                warn!("request error: {e}");
+let start = Instant::now();
+let res: Result<()> = async {
+    let mut c = cli.lock().await;
+    match which {
+        "hash" => {
+            let mut data = vec![0u8; 256];
+            for (i, b) in data.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(31).wrapping_add(7); }
+            let _ = c.hash_compute(&data).await?;
+        }
+        "sort" => {
+            let mut vals = vec![0i32; 1000];
+            for (i, v) in vals.iter_mut().enumerate() {
+                let x = ((i as u64 * 1_103_515_245u64 + 12_345u64) >> 8) as u32; // safe math
+                *v = (x as i32) ^ 0x5a5a5a5a;
             }
-        });
+            let _ = c.sort_array(vals).await?;
+        }
+        "matmul" => {
+            let n = 16usize;
+            let mut a = vec![0.0f64; n*n];
+            let mut b = vec![0.0f64; n*n];
+            for i in 0..n*n { a[i] = (i as f64).sin(); b[i] = (i as f64).cos(); }
+            let _ = c.matrix_multiply(n, a, b).await?;
+        }
+        "compress" => {
+            let mut data = vec![0u8; 512];
+            for (i, b) in data.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(17).wrapping_add(3); }
+            let _ = c.compress_data("zlib", &data).await?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}.await;
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let _ = txc.send(elapsed);
+    if let Err(e) = res {
+        warn!("request error: {e}");
+    }
+});
     }
 
     drop(tx);

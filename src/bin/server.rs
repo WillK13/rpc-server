@@ -193,3 +193,42 @@ async fn op_compress_data(params: serde_json::Value) -> Result<serde_json::Value
         "compressed_base64": B64.encode(out)
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    #[tokio::test]
+    async fn test_hash_compute() {
+        let data = B64.encode(b"abc");
+        let out = op_hash_compute(serde_json::json!({ "data_base64": data })).await.unwrap();
+        assert_eq!(out["hex"].as_str().unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[tokio::test]
+    async fn test_sort_array() {
+        let out = op_sort_array(serde_json::json!({ "values": [3,1,-5,7,1] })).await.unwrap();
+        assert_eq!(out["values"], serde_json::json!([-5,1,1,3,7]));
+    }
+
+    #[tokio::test]
+    async fn test_matrix_multiply_2x2() {
+        let out = op_matrix_multiply(serde_json::json!({
+            "n": 2,
+            "a": [1.0,2.0,3.0,4.0],
+            "b": [5.0,6.0,7.0,8.0]
+        })).await.unwrap();
+        assert_eq!(out["c"], serde_json::json!([19.0,22.0,43.0,50.0]));
+    }
+
+    #[tokio::test]
+    async fn test_compress_data_zlib() {
+        let out = op_compress_data(serde_json::json!({
+            "algo": "zlib",
+            "data_base64": B64.encode(b"hello hello hello")
+        })).await.unwrap();
+        assert!(out["compressed_base64"].as_str().unwrap().len() > 0);
+    }
+}
